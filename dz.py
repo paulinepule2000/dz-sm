@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import sys
+import unicodedata
 import warnings
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote, quote_plus
@@ -68,6 +69,10 @@ DRY_RUN           = os.environ.get("DRY_RUN", "0") == "1"
 # "1" = skip jobs that have no apply link/email.
 REQUIRE_APPLY_LINK = os.environ.get("REQUIRE_APPLY_LINK", "0") == "1"
 MAX_CONSECUTIVE_POST_FAILURES = 3
+
+# Base URL of your job pages on your website. The job slug is appended to it.
+# Set it per country, e.g. https://dz.mimusjobs.com/job
+SITE_JOB_BASE_URL = os.environ.get("SITE_JOB_BASE_URL", "https://mimusjobs.com/job").rstrip("/")
 
 # ── Mistral ──────────────────────────────────────────────────────────────────
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
@@ -2675,7 +2680,8 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
 #
 #  Flow:  this script ──POST JSON──▶ Make.com Custom Webhook ──▶ Facebook Pages
 #  Make receives:  message, title, company, location, job_type, deadline,
-#                  apply_link, apply_email, link, photo_url, logo_url, ...
+#                  apply_link, apply_email, link (= your website job URL),
+#                  site_url, photo_url, logo_url, ...
 # =============================================================================
 
 FB_MESSAGE_MAX_CHARS   = 1800   # keep posts readable
@@ -2706,6 +2712,21 @@ def _split_apply(application: str) -> tuple:
         return application, ""
     return "", ""
 
+def slugify_title(title: str) -> str:
+    """Mimic WordPress sanitize_title for Latin text:
+    'Senior Accountant (Algiers)' -> 'senior-accountant-algiers'."""
+    t = unicodedata.normalize("NFKD", title or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))   # strip accents
+    t = re.sub(r"['’`]", "", t.lower())                         # WP drops apostrophes
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return t
+
+def build_site_job_url(job: dict) -> str:
+    """Public URL of the job on your own website, e.g. https://mimusjobs.com/job/accountant"""
+    # Uses the same title that goes into the Excel / WordPress import
+    slug = slugify_title(job.get("jobTitle", ""))
+    return f"{SITE_JOB_BASE_URL}/{slug}" if slug else ""
+
 def build_facebook_message(job: dict) -> str:
     title    = sanitize_text(job.get("jobTitle", ""))
     company  = sanitize_text(job.get("companyName", ""))
@@ -2720,6 +2741,7 @@ def build_facebook_message(job: dict) -> str:
     desc     = sanitize_text(job.get("jobDescription", ""))
 
     apply_url, apply_email = _split_apply(job.get("application", ""))
+    site_url = build_site_job_url(job)
 
     lines = [f"📢 {title}"]
     if company:  lines.append(f"🏢 {company}")
@@ -2735,7 +2757,9 @@ def build_facebook_message(job: dict) -> str:
         lines += ["", snippet]
 
     lines.append("")
-    if apply_url:
+    if site_url:
+        lines.append(f"👉 View & apply: {site_url}")
+    elif apply_url:
         lines.append(f"👉 Apply here: {apply_url}")
     elif apply_email:
         lines.append(f"📩 Send your CV to: {apply_email}")
@@ -2753,6 +2777,7 @@ def build_facebook_message(job: dict) -> str:
 
 def build_make_payload(job: dict) -> dict:
     apply_url, apply_email = _split_apply(job.get("application", ""))
+    site_url = build_site_job_url(job)
     logo = job.get("companyLogo", "") or ""
     # Facebook can't use SVG/ICO as a photo
     photo_url = "" if (not logo or re.search(r"\.(svg|ico)(\?|$)", logo, re.I)) else logo
@@ -2767,7 +2792,8 @@ def build_make_payload(job: dict) -> dict:
         "salary":       job.get("salaryRange", ""),
         "apply_url":    apply_url,
         "apply_email":  apply_email,
-        "link":         apply_url,      # URL Facebook should attach as link preview
+        "link":         site_url,       # your website's job page (Facebook link preview)
+        "site_url":     site_url,
         "photo_url":    photo_url,      # usable image or "" (use a Router/filter in Make)
         "logo_url":     logo,
         "language":     job.get("_lang", ""),
@@ -2777,6 +2803,11 @@ def build_make_payload(job: dict) -> dict:
 def post_job_to_facebook(job: dict) -> tuple:
     """Send the job to the Make.com webhook. Returns (ok: bool, info: str)."""
     payload = build_make_payload(job)
+
+    # Guard: never send an empty post (Facebook error 197)
+    if not (payload.get("message") or "").strip():
+        log.error(f"Empty message for '{payload.get('title')}' — not sending to Make.com")
+        return False, "empty_message"
 
     if DRY_RUN:
         print(C_DIM("\n  [DRY_RUN] Payload that would be sent to Make.com:"))
@@ -2796,7 +2827,9 @@ def post_job_to_facebook(job: dict) -> tuple:
         try:
             r = requests.post(MAKE_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
             if r.status_code == 200:
-                log.info(f"✅ Sent to Make.com: '{payload['title']}' (response: {r.text[:60]!r})")
+                log.info(f"✅ Sent to Make.com: '{payload['title']}' "
+                         f"(message {len(payload['message'])} chars, link={payload['link'] or '—'}, "
+                         f"response: {r.text[:60]!r})")
                 return True, "sent"
             last_err = f"HTTP {r.status_code}: {r.text[:120]}"
             log.error(f"Make.com attempt {attempt+1} failed — {last_err}")
@@ -2823,12 +2856,14 @@ def print_job_verbose(job: dict, index: int, total: int):
     orig_title   = job.get("originalTitle", "")
     method       = job.get("_apply_method", "")
     lang         = job.get("_lang", "")
+    site_url     = build_site_job_url(job)
     print()
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
     print(f"  {C_LABEL('Title (original)')}   : {C_VALUE(orig_title)}")
     print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
+    print(f"  {C_LABEL('Site URL')}           : {C_GREEN(site_url) if site_url else C_DIM('— no slug —')}")
     print(f"  {C_LABEL('Language')}           : {lang or C_DIM('—')}")
     print(f"  {C_LABEL('Job Type')}            : {job.get('jobType','')}")
     print(f"  {C_LABEL('Field')}               : {job.get('jobField','') or C_DIM('—')}")
@@ -3004,6 +3039,7 @@ def craw():
     print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
     print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (English only — Arabic & French skipped)")
     print(f"  Facebook post : {'🧪 DRY RUN (nothing is sent)' if DRY_RUN else ('✅ via Make.com webhook' if MAKE_WEBHOOK_URL else '❌ MAKE_WEBHOOK_URL not set')}")
+    print(f"  Post link     : {SITE_JOB_BASE_URL}/<job-slug>")
     print(f"  Posts per run : {MAX_POSTS_PER_RUN} (delay {POST_DELAY_S}s between posts)")
     print(f"  Need apply    : {'yes — jobs without apply link/email are skipped' if REQUIRE_APPLY_LINK else 'no'}")
     print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
