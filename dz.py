@@ -1,18 +1,24 @@
 """
-fb_poster.py — posts jobs listed in processed_jobs_algeria.csv to a Facebook Page.
+dz.py — posts jobs listed in processed_jobs_algeria.csv to a Facebook Page.
 
-NO scraping. Every post is built from columns already in the CSV:
+The CSV is ALWAYS read from GitHub (raw URL below), never from a local copy,
+so the poster sees whatever the scraper last pushed.
+
+Every post is built from columns already in the CSV:
     Job Title, Company Name, Location, Short Description, Job Site URL
-Only rows with Status == "posted" AND a Job Site URL are used.
+Only rows with Status == "posted" are used.
+If "Job Site URL" is empty but the row has a WP ID and SITE_BASE_URL is set,
+the link falls back to  SITE_BASE_URL/?p=<WP ID>  (WordPress redirects it to
+the real permalink).
 
 Env vars
     FB_PAGE_ID             numeric Page ID                      (secret)
     FB_PAGE_ACCESS_TOKEN   Page access token (not user token)   (secret)
-    CSV_SOURCE             local path or URL of the CSV         default: processed_jobs_algeria.csv
-    CSV_TOKEN              optional GitHub token (private repo, when CSV_SOURCE is a URL)
+    CSV_SOURCE             URL of the CSV   default: the projectfetcher/dz raw URL
+    CSV_TOKEN              optional GitHub token (needed if the repo is private)
+    SITE_BASE_URL          e.g. https://algeria.mimusjobs.com   (optional fallback)
     FB_MAX_POSTS_PER_RUN   default 15
     FB_MAX_AGE_DAYS        skip rows older than this, default 7
-    FB_DRY_RUN             "1" = print posts, don't send, don't save state
 
 State: fb_posted_algeria.csv (Job ID, FB Post ID, Site Path, Timestamp) — remembers
 what was already posted so nothing is posted twice. Commit it back to the repo.
@@ -24,6 +30,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -36,8 +43,10 @@ except ImportError:
     pass
 
 # ── Config ───────────────────────────────────────────────────────────────────
-CSV_SOURCE   = os.environ.get("CSV_SOURCE", "processed_jobs_algeria.csv").strip()
-CSV_TOKEN    = os.environ.get("CSV_TOKEN", "").strip()
+DEFAULT_CSV_URL = "https://raw.githubusercontent.com/projectfetcher/dz/main/processed_jobs_algeria.csv"
+CSV_SOURCE   = os.environ.get("CSV_SOURCE", "").strip() or DEFAULT_CSV_URL
+CSV_TOKEN    = (os.environ.get("CSV_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")).strip()
+SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "").strip().rstrip("/")
 STATE_FILE   = "fb_posted_algeria.csv"
 STATE_COLS   = ["Job ID", "FB Post ID", "Site Path", "Timestamp"]
 
@@ -45,9 +54,8 @@ FB_PAGE_ID     = os.environ.get("FB_PAGE_ID", "").strip()
 FB_PAGE_TOKEN  = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
 FB_API_VERSION = "v21.0"
 FB_POST_DELAY_S      = 45
-FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15"))
-FB_MAX_AGE_DAYS      = int(os.environ.get("FB_MAX_AGE_DAYS", "7"))
-FB_DRY_RUN           = os.environ.get("FB_DRY_RUN", "").strip() == "1"
+FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15") or 15)
+FB_MAX_AGE_DAYS      = int(os.environ.get("FB_MAX_AGE_DAYS", "7") or 7)
 SNIPPET_CHARS        = 220
 HASHTAGS             = "#Algeria #Jobs #Hiring #Emploi"
 
@@ -55,7 +63,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("fb_poster")
 
 
-# ── CSV loading ──────────────────────────────────────────────────────────────
+# ── CSV loading (always from GitHub) ─────────────────────────────────────────
 def _to_raw_github_url(url: str) -> str:
     """Accepts a github.com/.../blob/... link and converts it to the raw file URL."""
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/blob/(.+)", url)
@@ -63,14 +71,26 @@ def _to_raw_github_url(url: str) -> str:
 
 
 def _read_source() -> str:
-    if CSV_SOURCE.lower().startswith("http"):
-        headers = {"Authorization": f"token {CSV_TOKEN}"} if CSV_TOKEN else {}
-        r = requests.get(_to_raw_github_url(CSV_SOURCE), headers=headers, timeout=30)
-        r.raise_for_status()
-        r.encoding = "utf-8"
-        return r.text.lstrip("\ufeff")
-    with open(CSV_SOURCE, encoding="utf-8-sig", newline="") as f:
-        return f.read()
+    url = _to_raw_github_url(CSV_SOURCE)
+    if not url.lower().startswith("http"):
+        raise ValueError(f"CSV_SOURCE must be a URL, got: {CSV_SOURCE!r}")
+
+    attempts = []
+    if CSV_TOKEN:
+        attempts.append({"Authorization": f"token {CSV_TOKEN}"})
+    attempts.append({})  # public repo / token rejected → try anonymously
+
+    last_err = None
+    for headers in attempts:
+        try:
+            r = requests.get(url, headers={**headers, "Cache-Control": "no-cache"}, timeout=30)
+            r.raise_for_status()
+            r.encoding = "utf-8"
+            log.info(f"CSV fetched from GitHub ({len(r.text)} chars)")
+            return r.text.lstrip("\ufeff")
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Could not download CSV from {url}: {last_err}")
 
 
 def load_rows() -> list:
@@ -95,37 +115,59 @@ def load_state() -> tuple:
     return ids, paths
 
 
-def save_state(job_id: str, fb_id: str, site_path: str):
+def save_state(job_id: str, fb_id: str, site_path_: str):
     new_file = not os.path.exists(STATE_FILE)
     with open(STATE_FILE, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if new_file:
             w.writerow(STATE_COLS)
-        w.writerow([job_id, fb_id, site_path, datetime.now().isoformat()])
+        w.writerow([job_id, fb_id, site_path_, datetime.now().isoformat()])
 
 
 # ── Row filtering / text building ────────────────────────────────────────────
+def job_link(row: dict) -> str:
+    """Job Site URL from the CSV, or a ?p=<WP ID> fallback built from SITE_BASE_URL."""
+    url = row.get("Job Site URL", "")
+    if url.startswith("http"):
+        return url
+    wp_id = row.get("WP ID", "")
+    if SITE_BASE_URL and wp_id:
+        try:
+            return f"{SITE_BASE_URL}/?p={int(float(wp_id))}"
+        except ValueError:
+            pass
+    return ""
+
+
 def site_path(url: str) -> str:
-    """Path only (e.g. /job/barista/) — keeps the domain out of logs and the state file."""
-    return urlparse(url).path or url
+    """Path (+query) only — keeps the domain out of logs and the state file."""
+    p = urlparse(url)
+    path = p.path or url
+    if p.query:
+        path += "?" + p.query
+    return path
 
 
 def parse_ts(value: str):
+    """Naive datetime, or None. Timezone info is stripped so comparisons never crash."""
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return None
 
 
-def is_eligible(row: dict, cutoff: datetime) -> bool:
+def skip_reason(row: dict, cutoff: datetime):
+    """Returns None if the row is eligible, otherwise a short reason string."""
     if row.get("Status", "").lower() != "posted":
-        return False
-    if not row.get("Job Title") or not row.get("Job Site URL", "").startswith("http"):
-        return False
+        return "status_not_posted"
+    if not row.get("Job Title"):
+        return "no_title"
+    if not job_link(row):
+        return "no_site_url"
     ts = parse_ts(row.get("Timestamp", ""))
     if ts and ts < cutoff:
-        return False
-    return True
+        return "too_old"
+    return None
 
 
 def clean_location(text: str) -> str:
@@ -145,7 +187,7 @@ def short_description(text: str, limit: int = SNIPPET_CHARS) -> str:
     return cut + "…"
 
 
-def build_message(row: dict) -> str:
+def build_message(row: dict, link: str) -> str:
     lines = [f"📢 {row['Job Title']}"]
     if row.get("Company Name"):
         lines.append(f"🏢 {row['Company Name']}")
@@ -155,7 +197,7 @@ def build_message(row: dict) -> str:
     snippet = short_description(row.get("Short Description", ""))
     if snippet:
         lines += ["", snippet]
-    lines += ["", f"👉 Full details & how to apply: {row['Job Site URL']}", "", HASHTAGS]
+    lines += ["", f"👉 Full details & how to apply: {link}", "", HASHTAGS]
     return "\n".join(lines)
 
 
@@ -172,7 +214,8 @@ def post_to_facebook(message: str, link: str) -> tuple:
                 return data["id"], "ok"
             err = data.get("error", {})
             code = err.get("code")
-            log.error(f"Facebook error (attempt {attempt+1}): {err.get('message', r.text[:200])}")
+            log.error(f"Facebook error (attempt {attempt+1}) code={code} "
+                      f"subcode={err.get('error_subcode')}: {err.get('message', r.text[:200])}")
             if code == 190:
                 return None, "bad_token"
             if code in (4, 17, 32, 613):
@@ -185,45 +228,49 @@ def post_to_facebook(message: str, link: str) -> tuple:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main() -> int:
-    if not FB_DRY_RUN and not (FB_PAGE_ID and FB_PAGE_TOKEN):
+    if not (FB_PAGE_ID and FB_PAGE_TOKEN):
         log.error("FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN not set — nothing posted.")
         return 1
 
     try:
         rows = load_rows()
     except Exception as e:
-        log.error(f"Could not read CSV source: {e}")
+        log.error(f"Could not read CSV from GitHub: {e}")
         return 1
 
     cutoff = datetime.now() - timedelta(days=FB_MAX_AGE_DAYS)
     done_ids, done_paths = load_state()
 
     todo, seen_paths = [], set()
+    skipped = Counter()
     for r in sorted(rows, key=lambda r: r.get("Timestamp", "")):
-        if not is_eligible(r, cutoff):
+        reason = skip_reason(r, cutoff)
+        if reason:
+            skipped[reason] += 1
             continue
-        p = site_path(r["Job Site URL"])
-        if r.get("Job ID") in done_ids or p in done_paths or p in seen_paths:
+        link = job_link(r)
+        p = site_path(link)
+        if r.get("Job ID") in done_ids or p in done_paths:
+            skipped["already_posted"] += 1
+            continue
+        if p in seen_paths:
+            skipped["duplicate_in_csv"] += 1
             continue
         seen_paths.add(p)
-        todo.append(r)
+        todo.append((r, link, p))
 
-    log.info(f"CSV rows: {len(rows)} | new jobs to post: {len(todo)} "
-             f"| cap this run: {FB_MAX_POSTS_PER_RUN}{' | DRY RUN' if FB_DRY_RUN else ''}")
+    log.info(f"CSV rows: {len(rows)} | new jobs to post: {len(todo)} | cap this run: {FB_MAX_POSTS_PER_RUN}")
+    if skipped:
+        log.info("Skipped rows by reason: " + ", ".join(f"{k}={v}" for k, v in skipped.most_common()))
 
     posted = 0
-    for r in todo:
+    for r, link, path in todo:
         if posted >= FB_MAX_POSTS_PER_RUN:
             log.info("Per-run cap reached — the rest will go out next run.")
             break
-        msg, path = build_message(r), site_path(r["Job Site URL"])
+        msg = build_message(r, link)
 
-        if FB_DRY_RUN:
-            print("\n" + "─" * 60 + f"\n{msg}\n")
-            posted += 1
-            continue
-
-        fb_id, status = post_to_facebook(msg, r["Job Site URL"])
+        fb_id, status = post_to_facebook(msg, link)
         if status == "ok":
             save_state(r.get("Job ID", ""), fb_id, path)
             posted += 1
