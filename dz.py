@@ -1,30 +1,7 @@
-"""
-dz.py — posts jobs listed in processed_jobs_algeria.csv to a Facebook Page.
-
-The CSV is ALWAYS read from GitHub (raw URL below), never from a local copy,
-so the poster sees whatever the scraper last pushed.
-
-Every post is built from columns already in the CSV:
-    Job Title, Company Name, Location, Short Description, Job Site URL
-Only rows with Status == "posted" are used.
-If "Job Site URL" is empty but the row has a WP ID and SITE_BASE_URL is set,
-the link falls back to  SITE_BASE_URL/?p=<WP ID>  (WordPress redirects it to
-the real permalink).
-
-Env vars
-    FB_PAGE_ID             numeric Page ID                      (secret)
-    FB_PAGE_ACCESS_TOKEN   Page access token (not user token)   (secret)
-    CSV_SOURCE             URL of the CSV   default: the projectfetcher/dz raw URL
-    CSV_TOKEN              optional GitHub token (needed if the repo is private)
-    SITE_BASE_URL          e.g. https://algeria.mimusjobs.com   (optional fallback)
-    FB_MAX_POSTS_PER_RUN   default 15
-    FB_MAX_AGE_DAYS        skip rows older than this, default 7
-
-State: fb_posted_algeria.csv (Job ID, FB Post ID, Site Path, Timestamp) — remembers
-what was already posted so nothing is posted twice. Commit it back to the repo.
-"""
 import csv
+import html as htmllib
 import io
+import json
 import logging
 import os
 import re
@@ -57,6 +34,9 @@ FB_POST_DELAY_S      = 45
 FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15") or 15)
 FB_MAX_AGE_DAYS      = int(os.environ.get("FB_MAX_AGE_DAYS", "7") or 7)
 SNIPPET_CHARS        = 220
+# 1 = only post jobs that have BOTH a short description and a location
+FB_REQUIRE_DETAILS   = os.environ.get("FB_REQUIRE_DETAILS", "1").strip() != "0"
+UA = {"User-Agent": "Mozilla/5.0 (compatible; MimusJobsFBPoster/1.0)"}
 HASHTAGS             = "#Algeria #Jobs #Hiring #Emploi"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -201,6 +181,91 @@ def build_message(row: dict, link: str) -> str:
     return "\n".join(lines)
 
 
+# ── Fill missing description / location from the job page ────────────────────
+def _strip_html(text: str) -> str:
+    text = htmllib.unescape(text or "")
+    text = re.sub(r"<(br|/p|/li|/div)[^>]*>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", htmllib.unescape(text)).strip()
+
+
+def _find_jobposting(node):
+    if isinstance(node, list):
+        for n in node:
+            found = _find_jobposting(n)
+            if found:
+                return found
+    elif isinstance(node, dict):
+        t = node.get("@type")
+        if t == "JobPosting" or (isinstance(t, list) and "JobPosting" in t):
+            return node
+        for v in node.values():
+            if isinstance(v, (list, dict)):
+                found = _find_jobposting(v)
+                if found:
+                    return found
+    return None
+
+
+def _location_from_jobposting(jp: dict) -> str:
+    parts = []
+    locs = jp.get("jobLocation") or []
+    for loc in (locs if isinstance(locs, list) else [locs]):
+        addr = loc.get("address", {}) if isinstance(loc, dict) else {}
+        if isinstance(addr, str):
+            parts.append(addr)
+            continue
+        for key in ("addressLocality", "addressRegion", "addressCountry"):
+            v = addr.get(key)
+            if isinstance(v, dict):
+                v = v.get("name")
+            if v and v not in parts:
+                parts.append(str(v))
+    return ", ".join(parts)
+
+
+def fetch_page_details(url: str) -> tuple:
+    """Returns (description, location, final_url) from the job page; empty strings on failure."""
+    try:
+        r = requests.get(url, headers=UA, timeout=25, allow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f"Could not open job page for details: {e}")
+        return "", "", url
+    page, desc, loc = r.text, "", ""
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                         page, flags=re.S | re.I):
+        try:
+            jp = _find_jobposting(json.loads(m.group(1).strip()))
+        except Exception:
+            continue
+        if jp:
+            desc = _strip_html(jp.get("description", ""))
+            loc = _location_from_jobposting(jp)
+            break
+    if not desc:
+        for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']',
+                    r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']'):
+            m = re.search(pat, page, flags=re.S | re.I)
+            if m:
+                desc = _strip_html(m.group(1))
+                break
+    return desc, loc, r.url
+
+
+def enrich_row(row: dict, link: str) -> tuple:
+    """Fills Short Description / Location from the page when the CSV lacks them. Returns (row, link)."""
+    if row.get("Short Description") and row.get("Location"):
+        return row, link
+    desc, loc, final_url = fetch_page_details(link)
+    row = dict(row)
+    if not row.get("Short Description") and desc:
+        row["Short Description"] = desc
+    if not row.get("Location") and loc:
+        row["Location"] = loc
+    return row, final_url
+
+
 # ── Facebook ─────────────────────────────────────────────────────────────────
 def post_to_facebook(message: str, link: str) -> tuple:
     """Returns (fb_post_id | None, status) where status is 'ok' | 'retry' | 'rate_limit' | 'bad_token'."""
@@ -268,11 +333,20 @@ def main() -> int:
         if posted >= FB_MAX_POSTS_PER_RUN:
             log.info("Per-run cap reached — the rest will go out next run.")
             break
+        r, link = enrich_row(r, link)
+        path = site_path(link)
+        if path in done_paths:
+            log.info(f"Already posted (same page): {path}")
+            continue
+        if FB_REQUIRE_DETAILS and not (r.get("Short Description") and r.get("Location")):
+            log.warning(f"Skipped '{r['Job Title']}': no description/location available ({path})")
+            continue
         msg = build_message(r, link)
 
         fb_id, status = post_to_facebook(msg, link)
         if status == "ok":
             save_state(r.get("Job ID", ""), fb_id, path)
+            done_paths.add(path)
             posted += 1
             log.info(f"✅ posted '{r['Job Title']}' → {fb_id}  ({path})")
             time.sleep(FB_POST_DELAY_S)
