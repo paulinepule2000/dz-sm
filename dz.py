@@ -11,7 +11,6 @@ import warnings
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote, quote_plus
 
-# ── Suppress SSL warnings ────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 import requests
@@ -26,22 +25,6 @@ try:
 except ImportError:
     pass
 
-# ── HuggingFace offline (cached model only, avoids 429 errors) ───────────────
-# Set HF_OFFLINE=0 in the environment to allow the model download.
-if os.environ.get("HF_OFFLINE", "1") == "1":
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_DATASETS_OFFLINE"] = "1"
-
-# =============================================================================
-#  OPTIONAL heavy deps
-# =============================================================================
-try:
-    import language_tool_python
-    from sentence_transformers import SentenceTransformer, util as st_util
-    _NLP_AVAILABLE = True
-except ImportError:
-    _NLP_AVAILABLE = False
-
 # =============================================================================
 #  CONFIG
 # =============================================================================
@@ -52,34 +35,31 @@ FETCH_CHAR_LIMIT = 120_000
 
 MAX_PAGES       = 0   # 0 = unlimited
 MAX_EMPTY_PAGES = 5
-JOB_LIMIT       = 0   # 0 = no cap on collected URLs
+JOB_LIMIT       = 0   # 0 = no cap
 
 OUTPUT_FILE        = "jobs_output_algeria.xlsx"
 PROCESSED_IDS_FILE = "processed_jobs_algeria.csv"
 
-# ── Make.com → Facebook Page ─────────────────────────────────────────────────
-MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "")   # custom webhook URL
-MAKE_API_KEY     = os.environ.get("MAKE_API_KEY", "")       # optional (x-make-apikey)
+# ── Facebook Page ────────────────────────────────────────────────────────────
+FB_PAGE_ID           = os.environ.get("FB_PAGE_ID", "")
+FB_PAGE_TOKEN        = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")   # PAGE token, not user token
+FB_API_VERSION       = "v21.0"
+FB_POST_DELAY_S      = 45     # pause after each successful post
+FB_MAX_POSTS_PER_RUN = int(os.environ.get("FB_MAX_POSTS_PER_RUN", "15"))
+FB_SNIPPET_CHARS     = 220
+FB_HASHTAGS          = "#Algeria #Jobs #Hiring #Emploi"
 
-# How many jobs to publish to Facebook per run (avoid flooding the page).
-MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN", "5"))
-POST_DELAY_S      = int(os.environ.get("POST_DELAY_S", "30"))   # pause between posts
-# "1" = build the payload and print it, but do NOT call Make.com (for testing).
-DRY_RUN           = os.environ.get("DRY_RUN", "0") == "1"
-# "1" = skip jobs that have no apply link/email.
-REQUIRE_APPLY_LINK = os.environ.get("REQUIRE_APPLY_LINK", "0") == "1"
-MAX_CONSECUTIVE_POST_FAILURES = 3
+# ── Your website (used to build the link shown on Facebook) — set as a secret ─
+SITE_BASE_URL = os.environ.get("SITE_BASE_URL", "").strip().rstrip("/")
+SITE_JOB_PATH = "job"        # -> <SITE_BASE_URL>/job/<slug>/
 
-# Base URL of your job pages on your website. The job slug is appended to it.
-# Set it per country, e.g. https://dz.mimusjobs.com/job
-SITE_JOB_BASE_URL = os.environ.get("SITE_JOB_BASE_URL", "https://mimusjobs.com/job").rstrip("/")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-# ── Mistral ──────────────────────────────────────────────────────────────────
-MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "")
-MISTRAL_MODEL   = "mistral-small-latest"
-MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
-
-ENABLE_PARAPHRASE = True
+for _var, _val in [("FB_PAGE_ID", FB_PAGE_ID), ("FB_PAGE_ACCESS_TOKEN", FB_PAGE_TOKEN),
+                   ("SITE_BASE_URL", SITE_BASE_URL)]:
+    if not _val:
+        log.warning(f"Environment variable {_var} is not set — Facebook posting will be skipped.")
 
 # =============================================================================
 #  KEYWORDS
@@ -90,19 +70,8 @@ SEARCH_KEYWORDS = [
 ]
 
 # =============================================================================
-#  LOGGING / COLOUR
+#  COLOUR
 # =============================================================================
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
-
-# ── Startup warnings ─────────────────────────────────────────────────────────
-for _var, _val, _feature in [
-    ("MISTRAL_API_KEY",  MISTRAL_API_KEY,  "paraphrasing"),
-    ("MAKE_WEBHOOK_URL", MAKE_WEBHOOK_URL, "Facebook posting"),
-]:
-    if not _val:
-        log.warning(f"Environment variable {_var} is not set — {_feature} will be disabled/skipped.")
 
 _USE_COLOUR = sys.stdout.isatty()
 
@@ -201,14 +170,6 @@ MONTH_MAP = {
     "jul":6,"aug":7,"sep":8,"oct":9,"nov":10,"dec":11,
 }
 
-JOB_TYPE_MAPPING = {
-    "full-time": "Full-time", "full time": "Full-time",
-    "part-time": "Part-time", "part time": "Part-time",
-    "contract":  "Contract",  "temporary": "Temporary",
-    "internship":"Internship","freelance": "Freelance",
-    "volunteer": "Volunteer",
-}
-
 INDUSTRY_KEYWORDS = [
     ("Information Technology", ["software","technology","it services","tech company","saas","cloud computing","it solutions"]),
     ("Finance & Banking", ["bank","financial services","fintech","insurance","investment","asset management"]),
@@ -304,7 +265,7 @@ def sanitize_text(text, is_url=False, is_email=False) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 # =============================================================================
-#  LANGUAGE DETECTION (en / fr / ar)
+#  LANGUAGE DETECTION (en / fr / ar) — used for stats only
 # =============================================================================
 
 _ARABIC_CHAR_RE  = re.compile(r"[\u0600-\u06FF\u0750-\u077F]")
@@ -320,375 +281,55 @@ _FRENCH_MARKERS  = re.compile(
 )
 
 def detect_text_language(text: str) -> str:
-    """'ar' for predominantly Arabic, 'fr' for predominantly French, else 'en'."""
     if not text:
         return "en"
-
     arabic_chars = len(_ARABIC_CHAR_RE.findall(text))
     latin_chars  = len(_LATIN_CHAR_RE.findall(text))
     total = arabic_chars + latin_chars
-
     if total > 0 and arabic_chars / total >= 0.4:
         return "ar"
-
     if latin_chars > 50:
         french_hits = len(_FRENCH_MARKERS.findall(text))
         word_count  = max(1, len(text.split()))
         if french_hits / word_count >= 0.08:
             return "fr"
-
     return "en"
 
 # =============================================================================
-#  NLP TOOLS (lazy init)
-# =============================================================================
-
-_grammar_tool       = None
-_sim_model          = None
-_sim_model_failed   = False
-
-def _get_grammar_tool():
-    global _grammar_tool
-    if _grammar_tool is None and _NLP_AVAILABLE:
-        try:
-            _grammar_tool = language_tool_python.LanguageTool(
-                "en-US", remote_server="https://api.languagetool.org")
-        except Exception as e:
-            log.warning(f"LanguageTool init failed: {e}")
-    return _grammar_tool
-
-def _get_sim_model():
-    global _sim_model, _sim_model_failed
-    if _sim_model_failed:
-        return None
-    if _sim_model is None and _NLP_AVAILABLE:
-        try:
-            _sim_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-        except Exception as e:
-            log.warning(f"SentenceTransformer init failed: {e}")
-            _sim_model_failed = True
-    return _sim_model
-
-def grammar_correct(text: str) -> str:
-    tool = _get_grammar_tool()
-    if tool:
-        try:
-            return language_tool_python.utils.correct(text, tool.check(text))
-        except Exception:
-            pass
-    return text
-
-def similarity_score(a: str, b: str) -> float:
-    model = _get_sim_model()
-    if model:
-        try:
-            emb = model.encode([a, b], convert_to_tensor=True)
-            return float(st_util.pytorch_cos_sim(emb[0], emb[1]))
-        except Exception:
-            pass
-    def tokens(s):
-        return set(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
-    ta, tb = tokens(a), tokens(b)
-    if not ta or not tb: return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
-
-# =============================================================================
-#  clean_output — strip LanguageTool "(suggestion limit reached)" garbage
-# =============================================================================
-
-def clean_output(text: str) -> str:
-    text = _fix_mojibake(text)
-    text = re.sub(r"\(suggestion limit reached\)", "", text, flags=re.I)
-    for pat in [r"\[/?INST\]", r"</?s>",
-                r"(?i)(rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
-                r"\*\*", r"###", r"---"]:
-        text = re.sub(pat, "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"\n\s*\n\s*\n", "\n\n", text)
-    return grammar_correct(text.strip())
-
-# =============================================================================
-#  MISTRAL API
-# =============================================================================
-
-def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
-    if not MISTRAL_API_KEY:
-        log.warning("MISTRAL_API_KEY not set — skipping paraphrase")
-        return ""
-    try:
-        response = requests.post(
-            MISTRAL_URL,
-            headers={
-                "Authorization": f"Bearer {MISTRAL_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MISTRAL_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.error(f"Mistral API error: {e}")
-        return ""
-
-# =============================================================================
-#  PARAPHRASE FUNCTIONS
-# =============================================================================
-
-def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
-    words = text.split()
-    line  = []
-    for w in words:
-        line.append(w)
-        if len(" ".join(line)) >= width:
-            print(f"{prefix}{' '.join(line)}")
-            line = []
-    if line:
-        print(f"{prefix}{' '.join(line)}")
-
-
-def paraphrase_title(title: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return title
-    clean = sanitize_text(title)
-    if not clean:
-        return title
-
-    print(f"\n ┌─ TITLE PARAPHRASE {'─'*45}")
-    print(f" │ Original : \"{clean}\"")
-    print(f" │ {'─'*60}")
-
-    best_result = None
-    best_sim    = 0.0
-
-    for attempt in range(4):
-        temp = round(0.68 + attempt * 0.06, 2)
-        print(f" │ Attempt {attempt+1} (temp={temp}):")
-
-        prompt = (
-            f"Rewrite this job title professionally using different words. "
-            f"Output ONLY the rewritten title, nothing else. "
-            f"Keep it between 4 and 12 words.\n\nJob title: {clean}"
-        )
-
-        raw    = mistral_generate(prompt, max_tokens=50, temperature=temp)
-        result = clean_output(raw).split("\n")[0].strip().strip('"').strip("'")
-
-        wc     = len(result.split()) if result else 0
-        sim    = similarity_score(clean, result) if result else 0.0
-        is_dup = result.lower().strip() == clean.lower().strip()
-
-        print(f" │    Output  : \"{result}\"")
-        print(f" │    Words   : {wc} | Similarity: {sim:.3f} | Duplicate: {'Yes ⚠️' if is_dup else 'No'}")
-
-        valid = bool(result) and 4 <= wc <= 14 and sim >= 0.55 and not is_dup
-
-        if not valid:
-            reasons = []
-            if not result:  reasons.append("empty output")
-            if wc < 4:      reasons.append(f"too short ({wc} words, min=4)")
-            if wc > 14:     reasons.append(f"too long ({wc} words, max=14)")
-            if sim < 0.55:  reasons.append(f"sim={sim:.3f} < 0.55")
-            if is_dup:      reasons.append("identical to original")
-            print(f" │    → ❌ REJECTED — {', '.join(reasons)}")
-        else:
-            if sim > best_sim:
-                best_sim    = sim
-                best_result = result
-                print(f" │    → ✅ ACCEPTED — new best candidate (sim={sim:.3f})")
-            else:
-                print(f" │    → ✅ VALID but not better than current best (best sim={best_sim:.3f})")
-
-        print(f" │ {'─'*60}")
-        time.sleep(1)
-
-    if best_result:
-        print(f" │ 🏆 FINAL SELECTED : \"{best_result}\"")
-        print(f" │    Similarity     : {best_sim:.3f}")
-        print(f" └{'─'*65}")
-        return best_result
-    else:
-        print(f" │ ⚠️  No valid paraphrase found → Keeping original: \"{clean}\"")
-        print(f" └{'─'*65}")
-        return clean
-
-
-def paraphrase_description(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text)
-    if not clean:
-        return text
-
-    paragraphs  = [p.strip() for p in clean.split("\n") if p.strip()]
-    rewritten   = []
-    success_count = 0
-
-    print(f"\n ┌─ DESCRIPTION PARAPHRASE ({len(paragraphs)} paragraphs) {'─'*25}")
-
-    for i, para in enumerate(paragraphs):
-        orig_wc = len(para.split())
-
-        print(f"\n │ ┌─ Paragraph {i+1}/{len(paragraphs)} {'─'*50}")
-        print(f" │ │ ORIGINAL ({orig_wc} words):")
-        _print_wrapped(para, prefix=" │ │    ")
-        print(f" │ │ {'─'*60}")
-
-        prompt = (
-            f"Rewrite this job description paragraph professionally in English. "
-            f"Keep ALL facts, requirements, and responsibilities. "
-            f"Use different sentence structure and vocabulary. "
-            f"Output ONLY the rewritten paragraph — no labels, no explanation.\n\n"
-            f"Original:\n{para}"
-        )
-
-        best_result = None
-        best_sim    = 0.0
-        accepted_text = None
-
-        for attempt in range(3):
-            temp = round(0.65 + attempt * 0.08, 2)
-            print(f" │ │ Attempt {attempt+1}/3 (temp={temp}):")
-
-            raw    = mistral_generate(prompt, max_tokens=500, temperature=temp)
-            result = clean_output(raw).strip()
-
-            rw  = len(result.split()) if result else 0
-            sim = similarity_score(para, result) if result and rw >= 5 else 0.0
-
-            if result:
-                print(f" │ │    Paraphrased ({rw} words, sim={sim:.3f}):")
-                _print_wrapped(result, prefix=" │ │       ")
-            else:
-                print(f" │ │    Paraphrased : (no output from model)")
-
-            valid = bool(result) and rw >= 8 and sim >= 0.48
-
-            if not valid:
-                reasons = []
-                if not result: reasons.append("empty output")
-                if rw < 8:     reasons.append(f"too short ({rw} words, min=8)")
-                if sim < 0.48: reasons.append(f"sim={sim:.3f} < 0.48")
-                print(f" │ │    → ❌ REJECTED — {', '.join(reasons)}")
-                if result and sim > best_sim:
-                    best_sim    = sim
-                    best_result = result
-                    print(f" │ │       (stored as best fallback, sim={sim:.3f})")
-            else:
-                print(f" │ │    → ✅ ACCEPTED on attempt {attempt+1}")
-                rewritten.append(result)
-                success_count += 1
-                accepted_text = result
-                break
-
-            print(f" │ │ {'─'*60}")
-            time.sleep(1)
-
-        if accepted_text is None:
-            print(f" │ │ {'─'*60}")
-            if best_result and best_sim >= 0.40:
-                print(f" │ │ 🔁 FALLBACK — Using best attempt (sim={best_sim:.3f}):")
-                _print_wrapped(best_result, prefix=" │ │    ")
-                rewritten.append(best_result)
-                success_count += 1
-            else:
-                print(f" │ │ ⚠️  KEPT ORIGINAL — no acceptable paraphrase (best sim={best_sim:.3f})")
-                rewritten.append(para)
-
-        print(f" │ └{'─'*62}")
-
-    print(f"\n │ SUMMARY: {success_count}/{len(paragraphs)} paragraphs successfully paraphrased")
-    print(f" └{'─'*80}\n")
-
-    return "\n\n".join(rewritten)
-
-
-def paraphrase_company(text: str) -> str:
-    if not ENABLE_PARAPHRASE:
-        return text
-    clean = sanitize_text(text)
-    if not clean:
-        return text
-
-    print(f"\n ┌─ COMPANY PARAPHRASE {'─'*43}")
-    orig_wc = len(clean.split())
-    print(f" │ Original ({orig_wc} words):")
-    _print_wrapped(clean, prefix=" │    ")
-    print(f" │ {'─'*60}")
-
-    prompt = (
-        f"Rewrite this company description professionally in English. "
-        f"Preserve all facts. Use different wording. "
-        f"Output ONLY the rewritten description.\n\nOriginal:\n{clean}"
-    )
-
-    raw    = mistral_generate(prompt, max_tokens=600, temperature=0.68)
-    result = clean_output(raw)
-    rw     = len(result.split()) if result else 0
-    sim    = similarity_score(clean, result) if result and rw >= 10 else 0.0
-
-    if result and rw >= 10:
-        print(f" │ Paraphrased ({rw} words, sim={sim:.3f}):")
-        _print_wrapped(result, prefix=" │    ")
-        print(f" │ → ✅ ACCEPTED")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return result
-    else:
-        reasons = []
-        if not result: reasons.append("empty output")
-        if rw < 10:    reasons.append(f"too short ({rw} words, min=10)")
-        print(f" │ → ❌ REJECTED — {', '.join(reasons)} — keeping original")
-        print(f" └{'─'*65}")
-        time.sleep(1)
-        return clean
-
-# =============================================================================
 #  DUPLICATE TRACKER
-#  Status values: scraped | paraphrased | posted | skipped | failed|<reason>
-#  Only "posted" and "skipped" count as processed (failed jobs are retried).
 # =============================================================================
 
 TRACKER_COLUMNS = ["Job ID", "Job URL", "Job Title", "Company Name",
-                   "Status", "Timestamp", "Post Ref"]
-_DONE_STATUSES  = ("posted", "skipped")
-
-def _read_tracker() -> pd.DataFrame:
-    if not os.path.exists(PROCESSED_IDS_FILE):
-        return pd.DataFrame(columns=TRACKER_COLUMNS)
-    df = pd.read_csv(PROCESSED_IDS_FILE, dtype=str).fillna("")
-    # migrate old WordPress tracker files
-    if "WP ID" in df.columns and "Post Ref" not in df.columns:
-        df = df.rename(columns={"WP ID": "Post Ref"})
-    for col in TRACKER_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    return df[TRACKER_COLUMNS]
+                   "Status", "Timestamp", "FB Post ID", "Site URL"]
 
 def _init_tracker():
     if not os.path.exists(PROCESSED_IDS_FILE):
         pd.DataFrame(columns=TRACKER_COLUMNS).to_csv(PROCESSED_IDS_FILE, index=False)
 
 def load_processed_ids() -> tuple:
+    """Jobs with status 'pending_fb' (scraped but not yet posted) are NOT treated
+    as processed, so they are retried on the next run."""
     _init_tracker()
-    df = _read_tracker()
-    done = df[df["Status"].astype(str).str.split("|").str[0].isin(_DONE_STATUSES)]
-    return set(done["Job ID"].astype(str)), set(done["Job URL"].astype(str))
+    df = pd.read_csv(PROCESSED_IDS_FILE)
+    if "Status" in df.columns:
+        df = df[df["Status"].fillna("") != "pending_fb"]
+    return (
+        set(df["Job ID"].fillna("").astype(str)),
+        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
+    )
 
 def _upsert_row(job_id: str, updates: dict):
     _init_tracker()
-    df   = _read_tracker()
+    df = pd.read_csv(PROCESSED_IDS_FILE, dtype=str).fillna("")
+    for col in TRACKER_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
     mask = df["Job ID"].astype(str) == str(job_id)
     if mask.any():
         for col, val in updates.items():
-            if col in df.columns:
-                df.loc[mask, col] = val
+            if col not in df.columns:
+                df[col] = ""
+            df.loc[mask, col] = val
         df.loc[mask, "Timestamp"] = datetime.now().isoformat()
     else:
         row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
@@ -706,17 +347,109 @@ def mark_scraped(job_id, job_url, title, company):
     _upsert_row(job_id, {"Job URL": job_url, "Job Title": title,
                           "Company Name": company, "Status": "scraped"})
 
-def mark_paraphrased(job_id):
-    _upsert_row(job_id, {"Status": "paraphrased"})
+def mark_posted(job_id, fb_post_id, site_url):
+    _upsert_row(job_id, {"Status": "posted", "FB Post ID": fb_post_id, "Site URL": site_url})
 
-def mark_posted(job_id, ref="make"):
-    _upsert_row(job_id, {"Status": "posted", "Post Ref": ref})
-
-def mark_skipped(job_id, reason=""):
-    _upsert_row(job_id, {"Status": "skipped", "Post Ref": reason})
+def mark_pending_fb(job_id):
+    _upsert_row(job_id, {"Status": "pending_fb"})
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
+
+# =============================================================================
+#  FACEBOOK POSTING
+# =============================================================================
+
+_fb_posts_this_run = 0
+
+def fb_configured() -> bool:
+    return bool(FB_PAGE_ID and FB_PAGE_TOKEN and SITE_BASE_URL)
+
+def fb_cap_reached() -> bool:
+    return _fb_posts_this_run >= FB_MAX_POSTS_PER_RUN
+
+def slugify(text: str, max_len: int = 80) -> str:
+    text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode()
+    text = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if len(text) > max_len:
+        text = text[:max_len].rsplit("-", 1)[0]
+    return text
+
+def build_site_job_url(job: dict) -> str:
+    """e.g. <SITE_BASE_URL>/job/accountant-sonatrach/"""
+    title   = job.get("jobTitle", "")
+    company = job.get("companyName", "")
+    slug = slugify(f"{title} {company}") or slugify(title)
+    if not slug:                               # Arabic-only titles slugify to ""
+        slug = f"job-{job.get('_jobId', '')}"
+    return f"{SITE_BASE_URL}/{SITE_JOB_PATH}/{slug}/"
+
+def _site_path(url: str) -> str:
+    """Strip the domain so logs / tracker / artifacts never contain it."""
+    return url.replace(SITE_BASE_URL, "", 1) if SITE_BASE_URL else url
+
+def short_description(text: str, limit: int = FB_SNIPPET_CHARS) -> str:
+    text = re.sub(r"[•·▪◦]\s*", "", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(".,;:!?")
+    return cut + "…"
+
+def build_fb_message(job: dict, url: str) -> str:
+    lines = [f"📢 {job.get('jobTitle', '').strip()}"]
+    if job.get("companyName"):
+        lines.append(f"🏢 {job['companyName'].strip()}")
+    if job.get("jobLocation"):
+        lines.append(f"📍 {job['jobLocation'].strip()}")
+    snippet = short_description(job.get("jobDescription", ""))
+    if snippet:
+        lines += ["", snippet]
+    lines += ["", f"👉 Full details & how to apply: {url}", "", FB_HASHTAGS]
+    return "\n".join(lines)
+
+def post_job_to_facebook(job: dict) -> tuple:
+    """Returns (fb_post_id, site_url) or (None, None)."""
+    global _fb_posts_this_run
+
+    if not fb_configured():
+        log.warning("FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN / SITE_BASE_URL not set — skipping Facebook post")
+        return None, None
+    if fb_cap_reached():
+        return None, None
+    if not job.get("jobTitle"):
+        return None, None
+
+    url = build_site_job_url(job)
+    payload = {
+        "message":      build_fb_message(job, url),
+        "link":         url,
+        "access_token": FB_PAGE_TOKEN,
+    }
+    endpoint = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/feed"
+
+    for attempt in range(3):
+        try:
+            r = requests.post(endpoint, data=payload, timeout=30)
+            data = r.json() if r.content else {}
+            if r.status_code == 200 and data.get("id"):
+                _fb_posts_this_run += 1
+                log.info(f"✅ Facebook post created: {data['id']}")
+                time.sleep(FB_POST_DELAY_S)
+                return data["id"], url
+
+            err  = data.get("error", {})
+            code = err.get("code")
+            log.error(f"Facebook error (attempt {attempt+1}): {err.get('message', r.text[:200])}")
+            if code == 190:                       # invalid / expired token
+                log.error("Facebook token invalid or expired — regenerate the Page token.")
+                return None, None
+            if code in (4, 17, 32, 613):          # rate limits — don't hammer
+                return None, None
+        except Exception as e:
+            log.error(f"Facebook request failed (attempt {attempt+1}): {e}")
+        time.sleep(2 ** attempt * 3)
+    return None, None
 
 # =============================================================================
 #  HELPERS
@@ -1002,10 +735,6 @@ def clean_email(raw: str) -> str:
     if not em or "@" not in em or "." not in em: return ""
     if not re.match(r"^[a-zA-Z0-9]", em): return ""
     return em
-
-# =============================================================================
-#  clean_application_link — block privacy/terms/login URLs
-# =============================================================================
 
 def clean_application_link(raw: str) -> str:
     if not raw: return ""
@@ -2131,7 +1860,7 @@ def extract_application_details(
         el = soup.select_one(sel)
         if el: desc_text = el.get_text(); break
 
-    # ── 0. JSON-LD ───────────────────────────────────────────────────────────
+    # 0. JSON-LD
     if ld.get("apply_url") and not is_bad_url(ld["apply_url"]):
         url = blank_if_linkedin(ld["apply_url"])
         url = clean_application_link(url)
@@ -2139,7 +1868,7 @@ def extract_application_details(
             log.info(f"apply found via JSON-LD: {url}")
             return {"url": url, "email": "", "method": "s0_jsonld"}
 
-    # ── 1. LinkedIn apply button ──────────────────────────────────────────────
+    # 1. LinkedIn apply button
     apply_btn = follow_linkedin_apply_button(soup, job_url)
     if apply_btn:
         apply_btn = clean_application_link(blank_if_linkedin(apply_btn))
@@ -2147,7 +1876,7 @@ def extract_application_details(
             log.info(f"apply found via LinkedIn button: {apply_btn}")
             return {"url": apply_btn, "email": "", "method": "s0_apply_button"}
 
-    # ── 2. Script tags on job page ────────────────────────────────────────────
+    # 2. Script tags on job page
     for script in soup.find_all("script"):
         txt = script.string or ""
         for pat in [r'"applyStartUrl"\s*:\s*"([^"]+)"',
@@ -2160,7 +1889,7 @@ def extract_application_details(
                     log.info(f"apply found via script tag: {cand}")
                     return {"url": cand, "email": "", "method": "s1b_script_tag"}
 
-    # ── 3. Deep crawl company website ─────────────────────────────────────────
+    # 3. Deep crawl company website
     deep_info = {}
     if company_website and not should_skip_crawl(company_website):
         log.info(f"v6 deep crawl starting: {company_website} for '{job_title}'")
@@ -2176,7 +1905,7 @@ def extract_application_details(
                 return {"url": apply_url, "email": "",
                         "method": deep_info.get("method") or "deep_url", "_deep": deep_info}
 
-    # ── 4. Links / URLs in job description ────────────────────────────────────
+    # 4. Links / URLs in job description
     desc_el = (soup.select_one(".show-more-less-html__markup") or
                soup.select_one(".description__text"))
     if desc_el:
@@ -2198,12 +1927,12 @@ def extract_application_details(
         log.info(f"apply found via description email: {em}")
         return {"url": "", "email": em, "method": "s5_desc_email", "_deep": deep_info}
 
-    # ── 5. Email from site_info ────────────────────────────────────────────────
+    # 5. Email from site_info
     if site_info and site_info.get("email"):
         log.info(f"apply found via site_info email: {site_info['email']}")
         return {"url": "", "email": site_info["email"], "method": "site_info_email", "_deep": deep_info}
 
-    # ── 6. v3 fallback crawl ──────────────────────────────────────────────────
+    # 6. v3 fallback crawl
     resolved = decode_linkedin_apply_url(company_website) or company_website
     resolved = blank_if_linkedin(resolved)
     if resolved and not is_bad_url(resolved):
@@ -2489,6 +2218,7 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     raw_desc    = sel_text(".show-more-less-html__markup", ".description__text")
     description = clean_description(raw_desc)
 
+    # FIX 1: detect language (now also detects French)
     desc_lang = detect_text_language(description)
 
     salary = ""
@@ -2619,37 +2349,14 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     qualifications = extract_qualification(description)
     experience     = extract_experience(description)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  PARAPHRASE — English only (French & Arabic are kept as-is)
-    # ─────────────────────────────────────────────────────────────────────────
     mark_scraped(job_id, job_url, title, merged_name)
     processed_ids.add(job_id)
     processed_urls.add(job_url)
 
-    paraphrased_title = title
-    paraphrased_desc  = description
-    paraphrased_about = merged_about
-
-    if ENABLE_PARAPHRASE and MISTRAL_API_KEY and desc_lang == "en":
-        print(C_BLUE(f"\n  ✍️  Paraphrasing '{title}' ..."))
-        paraphrased_title = paraphrase_title(title)
-        paraphrased_desc  = paraphrase_description(description)
-        if merged_about:
-            paraphrased_about = paraphrase_company(merged_about)
-        mark_paraphrased(job_id)
-    elif desc_lang == "ar":
-        print(C_DIM("  ⚠️  Paraphrasing skipped (Arabic description)"))
-    elif desc_lang == "fr":
-        print(C_DIM("  ⚠️  Paraphrasing skipped (French description)"))
-    else:
-        print(C_DIM("  ⚠️  Paraphrasing skipped (ENABLE_PARAPHRASE=False or MISTRAL_API_KEY not set)"))
-
     return {
-        "jobTitle":          paraphrased_title,
-        "jobDescription":    paraphrased_desc,
-        "companyDetails":    paraphrased_about,
-        "originalTitle":     title,
-        "originalDesc":      description,
+        "jobTitle":          title,
+        "jobDescription":    description,
+        "companyDetails":    merged_about,
         "jobType":           job_type,
         "jobQualifications": qualifications,
         "jobExperience":     experience,
@@ -2676,173 +2383,6 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     }
 
 # =============================================================================
-#  FACEBOOK POSTING VIA MAKE.COM WEBHOOK
-#
-#  Flow:  this script ──POST JSON──▶ Make.com Custom Webhook ──▶ Facebook Pages
-#  Make receives:  message, title, company, location, job_type, deadline,
-#                  apply_link, apply_email, link (= your website job URL),
-#                  site_url, photo_url, logo_url, ...
-# =============================================================================
-
-FB_MESSAGE_MAX_CHARS   = 1800   # keep posts readable
-FB_DESC_SNIPPET_CHARS  = 650
-
-def _truncate_at_boundary(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    cut = text[:limit]
-    # prefer cutting at the end of a sentence, else at a word boundary
-    last_stop = max(cut.rfind(". "), cut.rfind(".\n"), cut.rfind("! "), cut.rfind("? "))
-    if last_stop > limit * 0.5:
-        return cut[:last_stop + 1].strip() + " …"
-    return cut.rsplit(" ", 1)[0].strip() + " …"
-
-def _hashtag(text: str) -> str:
-    words = re.findall(r"[A-Za-z0-9]+", text or "")
-    return "#" + "".join(w.capitalize() for w in words) if words else ""
-
-def _split_apply(application: str) -> tuple:
-    """Return (apply_url, apply_email) from the 'application' field."""
-    application = (application or "").strip()
-    if not application:
-        return "", ""
-    if "@" in application and not application.startswith("http"):
-        return "", application
-    if application.startswith("http"):
-        return application, ""
-    return "", ""
-
-def slugify_title(title: str) -> str:
-    """Mimic WordPress sanitize_title for Latin text:
-    'Senior Accountant (Algiers)' -> 'senior-accountant-algiers'."""
-    t = unicodedata.normalize("NFKD", title or "")
-    t = "".join(c for c in t if not unicodedata.combining(c))   # strip accents
-    t = re.sub(r"['’`]", "", t.lower())                         # WP drops apostrophes
-    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
-    return t
-
-def build_site_job_url(job: dict) -> str:
-    """Public URL of the job on your own website, e.g. https://mimusjobs.com/job/accountant"""
-    # Uses the same title that goes into the Excel / WordPress import
-    slug = slugify_title(job.get("jobTitle", ""))
-    return f"{SITE_JOB_BASE_URL}/{slug}" if slug else ""
-
-def build_facebook_message(job: dict) -> str:
-    title    = sanitize_text(job.get("jobTitle", ""))
-    company  = sanitize_text(job.get("companyName", ""))
-    location = sanitize_text(job.get("jobLocation", ""))
-    raw_type = sanitize_text(job.get("jobType", ""))
-    jtype    = JOB_TYPE_MAPPING.get(raw_type.lower().strip(), raw_type)
-    salary   = sanitize_text(job.get("salaryRange", ""))
-    qualif   = sanitize_text(job.get("jobQualifications", ""))
-    exp      = sanitize_text(job.get("jobExperience", ""))
-    field    = sanitize_text(job.get("jobField", ""))
-    deadline = sanitize_text(job.get("deadline", "")) or sanitize_text(job.get("estimatedDeadline", ""))
-    desc     = sanitize_text(job.get("jobDescription", ""))
-
-    apply_url, apply_email = _split_apply(job.get("application", ""))
-    site_url = build_site_job_url(job)
-
-    lines = [f"📢 {title}"]
-    if company:  lines.append(f"🏢 {company}")
-    if location: lines.append(f"📍 {location}")
-    if jtype:    lines.append(f"🕒 {jtype}")
-    if exp:      lines.append(f"💼 Experience: {exp}")
-    if qualif:   lines.append(f"🎓 {qualif}")
-    if salary:   lines.append(f"💰 {salary}")
-    if deadline: lines.append(f"📅 Apply before: {deadline}")
-
-    if desc:
-        snippet = _truncate_at_boundary(re.sub(r"\n{2,}", "\n", desc), FB_DESC_SNIPPET_CHARS)
-        lines += ["", snippet]
-
-    lines.append("")
-    if site_url:
-        lines.append(f"👉 View & apply: {site_url}")
-    elif apply_url:
-        lines.append(f"👉 Apply here: {apply_url}")
-    elif apply_email:
-        lines.append(f"📩 Send your CV to: {apply_email}")
-
-    tags = ["#Algeria", "#Jobs", "#Hiring"]
-    if field:
-        ft = _hashtag(field)
-        if ft: tags.append(ft)
-    lines += ["", " ".join(tags)]
-
-    message = "\n".join(lines).strip()
-    if len(message) > FB_MESSAGE_MAX_CHARS:
-        message = message[:FB_MESSAGE_MAX_CHARS].rsplit(" ", 1)[0] + " …"
-    return message
-
-def build_make_payload(job: dict) -> dict:
-    apply_url, apply_email = _split_apply(job.get("application", ""))
-    site_url = build_site_job_url(job)
-    logo = job.get("companyLogo", "") or ""
-    # Facebook can't use SVG/ICO as a photo
-    photo_url = "" if (not logo or re.search(r"\.(svg|ico)(\?|$)", logo, re.I)) else logo
-    return {
-        "message":      build_facebook_message(job),
-        "title":        job.get("jobTitle", ""),
-        "company":      job.get("companyName", ""),
-        "location":     job.get("jobLocation", ""),
-        "job_type":     job.get("jobType", ""),
-        "job_field":    job.get("jobField", ""),
-        "deadline":     job.get("deadline", "") or job.get("estimatedDeadline", ""),
-        "salary":       job.get("salaryRange", ""),
-        "apply_url":    apply_url,
-        "apply_email":  apply_email,
-        "link":         site_url,       # your website's job page (Facebook link preview)
-        "site_url":     site_url,
-        "photo_url":    photo_url,      # usable image or "" (use a Router/filter in Make)
-        "logo_url":     logo,
-        "language":     job.get("_lang", ""),
-        "job_id":       job.get("_jobId", ""),
-    }
-
-def post_job_to_facebook(job: dict) -> tuple:
-    """Send the job to the Make.com webhook. Returns (ok: bool, info: str)."""
-    payload = build_make_payload(job)
-
-    # Guard: never send an empty post (Facebook error 197)
-    if not (payload.get("message") or "").strip():
-        log.error(f"Empty message for '{payload.get('title')}' — not sending to Make.com")
-        return False, "empty_message"
-
-    if DRY_RUN:
-        print(C_DIM("\n  [DRY_RUN] Payload that would be sent to Make.com:"))
-        print(C_DIM(json.dumps(payload, indent=2, ensure_ascii=False)))
-        return True, "dry_run"
-
-    if not MAKE_WEBHOOK_URL:
-        log.warning("MAKE_WEBHOOK_URL not set — skipping Facebook post")
-        return False, "no_webhook_url"
-
-    headers = {"Content-Type": "application/json"}
-    if MAKE_API_KEY:
-        headers["x-make-apikey"] = MAKE_API_KEY
-
-    last_err = ""
-    for attempt in range(3):
-        try:
-            r = requests.post(MAKE_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-            if r.status_code == 200:
-                log.info(f"✅ Sent to Make.com: '{payload['title']}' "
-                         f"(message {len(payload['message'])} chars, link={payload['link'] or '—'}, "
-                         f"response: {r.text[:60]!r})")
-                return True, "sent"
-            last_err = f"HTTP {r.status_code}: {r.text[:120]}"
-            log.error(f"Make.com attempt {attempt+1} failed — {last_err}")
-            if r.status_code == 429:
-                time.sleep(30 * (attempt + 1))
-        except Exception as e:
-            last_err = str(e)
-            log.error(f"Make.com attempt {attempt+1} error: {e}")
-        if attempt < 2:
-            time.sleep(2 ** attempt)
-    return False, last_err or "unknown_error"
-
-# =============================================================================
 #  VERBOSE PRINTER
 # =============================================================================
 
@@ -2853,17 +2393,14 @@ def print_job_verbose(job: dict, index: int, total: int):
     apply        = job.get("application", "")
     logo         = job.get("companyLogo", "")
     logo_source  = job.get("_logo_source", "")
-    orig_title   = job.get("originalTitle", "")
     method       = job.get("_apply_method", "")
     lang         = job.get("_lang", "")
-    site_url     = build_site_job_url(job)
     print()
     print(C_DIVIDER())
     print(C_HEADER(f"  JOB {index}/{total}"))
     print(C_DIVIDER())
-    print(f"  {C_LABEL('Title (original)')}   : {C_VALUE(orig_title)}")
-    print(f"  {C_LABEL('Title (paraphrased)')}: {C_GREEN(job.get('jobTitle',''))}")
-    print(f"  {C_LABEL('Site URL')}           : {C_GREEN(site_url) if site_url else C_DIM('— no slug —')}")
+    print(f"  {C_LABEL('Title')}              : {C_GREEN(job.get('jobTitle',''))}")
+    print(f"  {C_LABEL('Site path (for FB)')} : {C_BLUE(_site_path(build_site_job_url(job)))}")
     print(f"  {C_LABEL('Language')}           : {lang or C_DIM('—')}")
     print(f"  {C_LABEL('Job Type')}            : {job.get('jobType','')}")
     print(f"  {C_LABEL('Field')}               : {job.get('jobField','') or C_DIM('—')}")
@@ -3032,24 +2569,22 @@ def craw():
 
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER → FACEBOOK (via Make.com) — ALGERIA"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER — ALGERIA EDITION"))
     print(C_HEADER("=" * 72))
     print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
     print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
     print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
-    print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (English only — Arabic & French skipped)")
-    print(f"  Facebook post : {'🧪 DRY RUN (nothing is sent)' if DRY_RUN else ('✅ via Make.com webhook' if MAKE_WEBHOOK_URL else '❌ MAKE_WEBHOOK_URL not set')}")
-    print(f"  Post link     : {SITE_JOB_BASE_URL}/<job-slug>")
-    print(f"  Posts per run : {MAX_POSTS_PER_RUN} (delay {POST_DELAY_S}s between posts)")
-    print(f"  Need apply    : {'yes — jobs without apply link/email are skipped' if REQUIRE_APPLY_LINK else 'no'}")
+    print(f"  Facebook      : {'✅ configured' if fb_configured() else '❌ FB_PAGE_ID / FB_PAGE_ACCESS_TOKEN / SITE_BASE_URL missing'} (max {FB_MAX_POSTS_PER_RUN} posts/run)")
     print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
     print(f"  Apply filter  : ❌ Privacy/Terms/Login URLs BLOCKED")
-    print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool (token-overlap fallback)'}")
+    print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
+    print(f"  Logo priority : company-website logo > LinkedIn logo")
+    print(f"  SSL warnings  : suppressed")
     print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
 
     processed_ids, processed_urls = load_processed_ids()
-    print(f"  Tracker loaded: {len(processed_ids)} already posted/skipped job IDs\n")
+    print(f"  Tracker loaded: {len(processed_ids)} previously processed job IDs\n")
 
     seen_urls = set(); all_job_urls = []; seen_content = set()
 
@@ -3071,55 +2606,39 @@ def craw():
     print()
 
     jobs = []; errors = 0
-    posted_count = 0; post_failures = 0; consecutive_failures = 0
-
     for j, url in enumerate(all_job_urls):
-        if MAX_POSTS_PER_RUN and posted_count >= MAX_POSTS_PER_RUN:
-            print(C_GREEN(f"\n  ✔ Reached MAX_POSTS_PER_RUN ({MAX_POSTS_PER_RUN}) — stopping."))
+        if fb_configured() and fb_cap_reached():
+            print(C_DIM(f"  ⏸  Facebook cap ({FB_MAX_POSTS_PER_RUN}/run) reached — remaining jobs will be picked up next run"))
             break
-        if consecutive_failures >= MAX_CONSECUTIVE_POST_FAILURES:
-            print(C_RED(f"\n  ✖ {consecutive_failures} Make.com failures in a row — stopping."))
-            break
-
         print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
         log.info(f"URL: {url}")
         try:
             job = scrape_job_details(url, processed_ids, processed_urls)
             if job and job.get("jobTitle"):
                 fp = (
-                    (job.get("originalTitle") or "").lower().strip(),
+                    (job.get("jobTitle") or "").lower().strip(),
                     (job.get("companyName")   or "").lower().strip(),
                     (job.get("jobLocation")   or "").lower().strip(),
                 )
                 if fp in seen_content:
                     print(C_DIM(f"  ⧳  Duplicate content — skipped"))
-                    mark_skipped(job["_jobId"], "duplicate_content")
-                    continue
-
-                seen_content.add(fp)
-                jobs.append(job)
-                print_job_verbose(job, j+1, len(all_job_urls))
-
-                if REQUIRE_APPLY_LINK and not job.get("application"):
-                    print(C_DIM("  ⧳  No apply link/email — not posted"))
-                    mark_skipped(job["_jobId"], "no_apply_link")
-                    continue
-
-                print(C_BLUE(f"\n  📤 Sending to Make.com → Facebook …"))
-                ok, info = post_job_to_facebook(job)
-                if ok:
-                    mark_posted(job["_jobId"], info)
-                    posted_count += 1
-                    consecutive_failures = 0
-                    print(C_GREEN(f"  ✅ Posted ({posted_count}/{MAX_POSTS_PER_RUN or '∞'})"))
-                    if (not MAX_POSTS_PER_RUN or posted_count < MAX_POSTS_PER_RUN) and not DRY_RUN:
-                        print(C_DIM(f"  Waiting {POST_DELAY_S}s before next job ..."))
-                        time.sleep(POST_DELAY_S)
                 else:
-                    mark_failed(job["_jobId"], f"make_post_failed:{info}"[:120])
-                    post_failures += 1
-                    consecutive_failures += 1
-                    print(C_RED(f"  ❌ Make.com post failed: {info}"))
+                    seen_content.add(fp)
+                    jobs.append(job)
+                    print_job_verbose(job, j+1, len(all_job_urls))
+
+                    print(C_BLUE(f"\n  📤 Posting to Facebook …"))
+                    if not fb_configured():
+                        mark_pending_fb(job["_jobId"])      # retried once credentials exist
+                        print(C_RED("  ❌ Facebook not configured — job kept pending"))
+                    else:
+                        fb_id, site_url = post_job_to_facebook(job)
+                        if fb_id:
+                            mark_posted(job["_jobId"], fb_id, _site_path(site_url or ""))
+                            print(C_GREEN(f"  ✅ FB post={fb_id}  🔗 {_site_path(site_url or '')}"))
+                        else:
+                            mark_failed(job["_jobId"], "fb_post_failed")
+                            print(C_RED("  ❌ Facebook post failed"))
             else:
                 print(C_RED("  ✗  No title found / skipped"))
         except Exception as e:
@@ -3136,11 +2655,9 @@ def craw():
     mins = round((time.time() - start_time) / 60, 1)
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  RUN COMPLETE"))
+    print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 72))
     print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
-    print(f"  {C_LABEL('Posted to FB')}   : {C_GREEN(str(posted_count))}{' (dry run)' if DRY_RUN else ''}")
-    print(f"  {C_LABEL('Post failures')}  : {C_RED(str(post_failures)) if post_failures else '0'}")
     print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
     print(f"  {C_LABEL('Duration')}       : ~{mins} min")
     print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
@@ -3188,8 +2705,6 @@ def craw():
             pct    = round(filled / len(jobs) * 100) if jobs else 0
             print(f"    {label:<20} {filled}/{len(jobs)} ({pct}%)")
 
-        para_count = sum(1 for j in jobs if j.get("jobTitle") != j.get("originalTitle"))
-        print(f"\n  {C_LABEL('Paraphrased titles')} : {para_count}/{len(jobs)}")
 
     print(C_HEADER("=" * 72))
 
